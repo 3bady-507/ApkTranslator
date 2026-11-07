@@ -1,0 +1,817 @@
+name: Build APK
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create project files
+        run: |
+          mkdir -p "$(dirname settings.gradle.kts)"
+          cat > settings.gradle.kts <<'APKEOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "ApkTranslator"
+          include(":app")
+          APKEOF
+          mkdir -p "$(dirname build.gradle.kts)"
+          cat > build.gradle.kts <<'APKEOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          APKEOF
+          mkdir -p "$(dirname gradle.properties)"
+          cat > gradle.properties <<'APKEOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          kotlin.code.style=official
+          APKEOF
+          mkdir -p "$(dirname app/build.gradle.kts)"
+          cat > app/build.gradle.kts <<'APKEOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.apktranslator"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.apktranslator"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release { isMinifyEnabled = false }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("com.android.tools.build:apksig:8.5.2")
+          }
+          APKEOF
+          mkdir -p "$(dirname app/src/main/AndroidManifest.xml)"
+          cat > app/src/main/AndroidManifest.xml <<'APKEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="مترجم التطبيقات"
+                  android:largeHeap="true"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          APKEOF
+          mkdir -p "$(dirname app/src/main/java/com/example/apktranslator/ArscDoc.kt)"
+          cat > app/src/main/java/com/example/apktranslator/ArscDoc.kt <<'APKEOF'
+          package com.example.apktranslator
+
+          import java.io.ByteArrayOutputStream
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+
+          /** String pool chunk of resources.arsc (read + rebuild). */
+          class ArscStringPool(private val buf: ByteBuffer, val start: Int) {
+              val headerSize = u16(start + 2)
+              val chunkSize = buf.getInt(start + 4)
+              val stringCount = buf.getInt(start + 8)
+              val styleCount = buf.getInt(start + 12)
+              private val flags = buf.getInt(start + 16)
+              private val stringsStart = buf.getInt(start + 20)
+              private val stylesStart = buf.getInt(start + 24)
+              val isUtf8 = (flags and 0x100) != 0
+
+              init {
+                  if (u16(start) != 0x0001) throw IllegalStateException("resources.arsc: string pool not found")
+              }
+
+              private fun u8(p: Int) = buf.get(p).toInt() and 0xFF
+              private fun u16(p: Int) = buf.getShort(p).toInt() and 0xFFFF
+
+              private fun offsetOf(i: Int): Int = start + stringsStart + buf.getInt(start + headerSize + 4 * i)
+
+              // returns [value, bytesUsed]
+              private fun len8(p: Int): IntArray {
+                  val b0 = u8(p)
+                  return if ((b0 and 0x80) != 0) intArrayOf(((b0 and 0x7F) shl 8) or u8(p + 1), 2) else intArrayOf(b0, 1)
+              }
+
+              private fun len16(p: Int): IntArray {
+                  val w0 = u16(p)
+                  return if ((w0 and 0x8000) != 0) intArrayOf(((w0 and 0x7FFF) shl 16) or u16(p + 2), 4) else intArrayOf(w0, 2)
+              }
+
+              private fun endOf(i: Int): Int {
+                  val b = offsetOf(i)
+                  return if (isUtf8) {
+                      val l1 = len8(b)
+                      val l2 = len8(b + l1[1])
+                      b + l1[1] + l2[1] + l2[0] + 1
+                  } else {
+                      val l = len16(b)
+                      b + l[1] + l[0] * 2 + 2
+                  }
+              }
+
+              fun raw(i: Int): ByteArray {
+                  val b = offsetOf(i)
+                  val out = ByteArray(endOf(i) - b)
+                  val d = buf.duplicate()
+                  d.position(b)
+                  d.get(out)
+                  return out
+              }
+
+              fun text(i: Int): String {
+                  val b = offsetOf(i)
+                  val d = buf.duplicate()
+                  return if (isUtf8) {
+                      val l1 = len8(b)
+                      val l2 = len8(b + l1[1])
+                      val bytes = ByteArray(l2[0])
+                      d.position(b + l1[1] + l2[1])
+                      d.get(bytes)
+                      String(bytes, Charsets.UTF_8)
+                  } else {
+                      val l = len16(b)
+                      val bytes = ByteArray(l[0] * 2)
+                      d.position(b + l[1])
+                      d.get(bytes)
+                      String(bytes, Charsets.UTF_16LE)
+                  }
+              }
+
+              private fun encode(s: String): ByteArray? {
+                  val o = ByteArrayOutputStream()
+                  if (isUtf8) {
+                      val bytes = s.toByteArray(Charsets.UTF_8)
+                      if (s.length > 0x7FFF || bytes.size > 0x7FFF) return null
+                      for (n in intArrayOf(s.length, bytes.size)) {
+                          if (n > 0x7F) {
+                              o.write((n shr 8) or 0x80)
+                              o.write(n and 0xFF)
+                          } else o.write(n)
+                      }
+                      o.write(bytes)
+                      o.write(0)
+                  } else {
+                      if (s.length > 0x7FFF) return null
+                      o.write(s.length and 0xFF)
+                      o.write((s.length shr 8) and 0xFF)
+                      o.write(s.toByteArray(Charsets.UTF_16LE))
+                      o.write(0)
+                      o.write(0)
+                  }
+                  return o.toByteArray()
+              }
+
+              /** Rebuilds the whole chunk with the given replacements (index -> new text). */
+              fun rebuild(repl: Map<Int, String>): ByteArray {
+                  val pieces = ArrayList<ByteArray>(stringCount)
+                  var strLen = 0
+                  for (i in 0 until stringCount) {
+                      val r = repl[i]
+                      val enc = if (r != null) encode(r) else null
+                      val p = enc ?: raw(i)
+                      pieces.add(p)
+                      strLen += p.size
+                  }
+                  val pad = (4 - strLen % 4) % 4
+                  val newStringsStart = headerSize + 4 * (stringCount + styleCount)
+                  val styleRawLen = if (styleCount > 0) start + chunkSize - (start + stylesStart) else 0
+                  val newStylesStart = if (styleCount > 0) newStringsStart + strLen + pad else 0
+                  val total = newStringsStart + strLen + pad + styleRawLen
+
+                  val out = ByteBuffer.allocate(total).order(ByteOrder.LITTLE_ENDIAN)
+                  val src = buf.duplicate()
+                  src.position(start)
+                  src.limit(start + headerSize)
+                  out.put(src)
+                  out.putInt(4, total)
+                  out.putInt(16, flags and 1.inv())            // clear SORTED
+                  out.putInt(20, newStringsStart)
+                  out.putInt(24, newStylesStart)
+                  out.position(headerSize)
+
+                  var off = 0
+                  for (p in pieces) {
+                      out.putInt(off)
+                      off += p.size
+                  }
+                  for (k in 0 until styleCount) {
+                      out.putInt(buf.getInt(start + headerSize + 4 * (stringCount + k)))
+                  }
+                  for (p in pieces) out.put(p)
+                  for (k in 0 until pad) out.put(0)
+                  if (styleRawLen > 0) {
+                      val sd = buf.duplicate()
+                      sd.position(start + stylesStart)
+                      sd.limit(start + stylesStart + styleRawLen)
+                      out.put(sd)
+                  }
+                  return out.array()
+              }
+          }
+
+          /** Minimal resources.arsc reader/writer: finds translatable strings and swaps them in the global pool. */
+          class ArscDoc(private val bytes: ByteArray) {
+              private val buf: ByteBuffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+              private val tableHeaderSize = u16(2)
+              private val globalPool = ArscStringPool(buf, tableHeaderSize)
+
+              init {
+                  if (u16(0) != 0x0002) throw IllegalStateException("resources.arsc is not a valid table")
+              }
+
+              private fun u8(p: Int) = buf.get(p).toInt() and 0xFF
+              private fun u16(p: Int) = buf.getShort(p).toInt() and 0xFFFF
+
+              private val skipKeyPrefix = listOf("google_", "firebase_", "gcm_", "facebook_", "fb_", "com.google")
+              private val skipKeySuffix = listOf(
+                  "_url", "_uri", "_id", "_key", "_token", "_format", "_pattern", "_regex", "_scheme",
+                  "_host", "_path", "_authority", "_package", "_class", "_action", "_font_family"
+              )
+
+              private fun skipKey(key: String, typeName: String): Boolean {
+                  val k = key.lowercase()
+                  if (skipKeyPrefix.any { k.startsWith(it) }) return true
+                  if (skipKeySuffix.any { k.endsWith(it) }) return true
+                  if (typeName == "array" && (k.contains("value") || k.endsWith("_keys") || k.endsWith("_ids") || k.endsWith("_codes"))) return true
+                  return false
+              }
+
+              fun findCandidates(): Map<Int, String> {
+                  val allowed = LinkedHashSet<Int>()
+                  val blocked = HashSet<Int>()
+                  val tableSize = minOf(buf.getInt(4), bytes.size)
+                  var pos = globalPool.start + globalPool.chunkSize
+                  while (pos + 8 <= tableSize) {
+                      val type = u16(pos)
+                      val size = buf.getInt(pos + 4)
+                      if (size <= 0) break
+                      if (type == 0x0200) scanPackage(pos, allowed, blocked)
+                      pos += size
+                  }
+                  allowed.removeAll(blocked)
+                  val out = LinkedHashMap<Int, String>()
+                  for (i in allowed) {
+                      // first styleCount strings are styled (spans) -> left untouched
+                      if (i >= globalPool.styleCount && i < globalPool.stringCount) out[i] = globalPool.text(i)
+                  }
+                  return out
+              }
+
+              private fun scanPackage(p: Int, allowed: MutableSet<Int>, blocked: MutableSet<Int>) {
+                  val hdr = u16(p + 2)
+                  val size = buf.getInt(p + 4)
+                  val typePool = ArscStringPool(buf, p + buf.getInt(p + 268))
+                  val keyPool = ArscStringPool(buf, p + buf.getInt(p + 276))
+                  val keyCache = HashMap<Int, String>()
+                  val end = minOf(p + size, bytes.size)
+                  var q = p + hdr
+                  while (q + 8 <= end) {
+                      val t = u16(q)
+                      val sz = buf.getInt(q + 4)
+                      if (sz <= 0) break
+                      if (t == 0x0201) scanType(q, typePool, keyPool, keyCache, allowed, blocked)
+                      q += sz
+                  }
+              }
+
+              private fun scanType(
+                  q: Int, typePool: ArscStringPool, keyPool: ArscStringPool, keyCache: HashMap<Int, String>,
+                  allowed: MutableSet<Int>, blocked: MutableSet<Int>
+              ) {
+                  val typeId = u8(q + 8)
+                  if (typeId == 0 || typeId > typePool.stringCount) return
+                  val typeName = typePool.text(typeId - 1)
+                  if (typeName != "string" && typeName != "plurals" && typeName != "array") return
+
+                  val hdr = u16(q + 2)
+                  val flags = u8(q + 9)
+                  val entryCount = buf.getInt(q + 12)
+                  val entriesStart = buf.getInt(q + 16)
+                  val defaultLang = u8(q + 28) == 0 && u8(q + 29) == 0
+
+                  for (i in 0 until entryCount) {
+                      val entryOff: Int = when {
+                          (flags and 0x01) != 0 -> u16(q + hdr + 4 * i + 2) * 4          // sparse
+                          (flags and 0x02) != 0 -> {                                      // offset16
+                              val o = u16(q + hdr + 2 * i)
+                              if (o == 0xFFFF) continue
+                              o * 4
+                          }
+                          else -> {
+                              val o = buf.getInt(q + hdr + 4 * i)
+                              if (o == -1) continue
+                              o
+                          }
+                      }
+                      val e = q + entriesStart + entryOff
+                      if (e + 16 > bytes.size) continue
+                      val eflags = u16(e + 2)
+                      if ((eflags and 0x08) != 0) continue // compact entry
+                      val keyIdx = buf.getInt(e + 4)
+                      val key = keyCache.getOrPut(keyIdx) {
+                          if (keyIdx in 0 until keyPool.stringCount) keyPool.text(keyIdx) else ""
+                      }
+                      val skip = skipKey(key, typeName)
+                      val target: MutableSet<Int>? = if (skip) blocked else if (defaultLang) allowed else null
+                      if (target == null) continue
+
+                      if ((eflags and 0x01) == 0) {
+                          if (u8(e + 11) == 0x03) target.add(buf.getInt(e + 12))
+                      } else {
+                          val count = buf.getInt(e + 12)
+                          val base = e + 16
+                          for (j in 0 until count) {
+                              val item = base + 8 * j
+                              if (item + 12 > bytes.size) break
+                              if (u8(item + 7) == 0x03) target.add(buf.getInt(item + 8))
+                          }
+                      }
+                  }
+              }
+
+              fun applyTranslations(repl: Map<Int, String>): ByteArray {
+                  val newPool = globalPool.rebuild(repl)
+                  val restStart = globalPool.start + globalPool.chunkSize
+                  val restLen = bytes.size - restStart
+                  val total = globalPool.start + newPool.size + restLen
+                  val out = ByteArray(total)
+                  System.arraycopy(bytes, 0, out, 0, globalPool.start)
+                  System.arraycopy(newPool, 0, out, globalPool.start, newPool.size)
+                  System.arraycopy(bytes, restStart, out, globalPool.start + newPool.size, restLen)
+                  ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN).putInt(4, total)
+                  return out
+              }
+          }
+          APKEOF
+          mkdir -p "$(dirname app/src/main/java/com/example/apktranslator/Translator.kt)"
+          cat > app/src/main/java/com/example/apktranslator/Translator.kt <<'APKEOF'
+          package com.example.apktranslator
+
+          import org.json.JSONArray
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.net.URLEncoder
+
+          object Translator {
+              // format specifiers, {placeholders}, html tags, html entities
+              private val PROTECT = Regex("""%(?:\d+\$)?[-#+0,(]*\d*(?:\.\d+)?[a-zA-Z%]|\{[^{}]*\}|<[^>]*>|&[a-zA-Z]+;|&#\d+;""")
+              private val RESTORE = Regex("""Z\s*Q\s*([0-9\u0660-\u0669]+)\s*Z\s*Q""", RegexOption.IGNORE_CASE)
+              private val TWO_LETTERS = Regex("[A-Za-z]{2}")
+              private val ARABIC = Regex("[\u0600-\u06FF]")
+              private val CAMEL = Regex("[a-z][A-Z]")
+              private val DATE_CHARS = Regex("[yMdHhmsSaEzZ\\-:/.,'\\s]+")
+              private val DATE_HINT = Regex("(yy|MM|dd|HH|hh|mm|ss)")
+
+              fun looksTranslatable(s: String): Boolean {
+                  val t = s.trim()
+                  if (t.length < 2 || t.length > 4000) return false
+                  if (!TWO_LETTERS.containsMatchIn(t)) return false
+                  if (ARABIC.containsMatchIn(t)) return false
+                  if (!PROTECT.replace(t, "").let { TWO_LETTERS.containsMatchIn(it) }) return false
+                  if (DATE_HINT.containsMatchIn(t) && DATE_CHARS.matches(t)) return false
+                  if (t.none { it.isWhitespace() }) {
+                      if (t.contains('_') || t.contains('/') || t.contains('@') || t.contains('-')) return false
+                      if (CAMEL.containsMatchIn(t)) return false
+                      if (t.contains('.') && !t.endsWith(".")) return false
+                      if (t.length >= 16 && t.any { it.isDigit() }) return false
+                  }
+                  return true
+              }
+
+              /** Returns Arabic text, or null if translation failed (caller keeps the original). */
+              fun translate(src: String): String? {
+                  val lead = src.takeWhile { it.isWhitespace() }
+                  val trail = src.takeLastWhile { it.isWhitespace() }
+                  val core = src.trim()
+                  if (core.isEmpty()) return null
+
+                  val tokens = ArrayList<String>()
+                  val protectedText = PROTECT.replace(core) { m ->
+                      tokens.add(m.value)
+                      "ZQ${tokens.size - 1}ZQ"
+                  }
+                  val raw = callApi(protectedText) ?: return null
+
+                  val seen = BooleanArray(tokens.size)
+                  val restored = RESTORE.replace(raw) { m ->
+                      val idx = m.groupValues[1].map { Character.digit(it, 10) }.joinToString("").toIntOrNull() ?: -1
+                      if (idx in tokens.indices) {
+                          seen[idx] = true
+                          tokens[idx]
+                      } else m.value
+                  }
+                  if (seen.any { !it }) return null // a placeholder got lost -> keep original, safer
+                  return lead + restored + trail
+              }
+
+              private fun callApi(text: String): String? {
+                  for (attempt in 0 until 4) {
+                      try {
+                          val url = URL("https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ar&dt=t")
+                          val conn = url.openConnection() as HttpURLConnection
+                          conn.requestMethod = "POST"
+                          conn.connectTimeout = 15000
+                          conn.readTimeout = 25000
+                          conn.doOutput = true
+                          conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+                          conn.setRequestProperty("User-Agent", "Mozilla/5.0")
+                          conn.outputStream.use { it.write(("q=" + URLEncoder.encode(text, "UTF-8")).toByteArray()) }
+                          if (conn.responseCode == 200) {
+                              val json = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                              val arr = JSONArray(json).getJSONArray(0)
+                              val sb = StringBuilder()
+                              for (i in 0 until arr.length()) {
+                                  val seg = arr.getJSONArray(i)
+                                  if (!seg.isNull(0)) sb.append(seg.getString(0))
+                              }
+                              conn.disconnect()
+                              return if (sb.isEmpty()) null else sb.toString()
+                          }
+                          conn.disconnect()
+                      } catch (e: Exception) {
+                          // retry
+                      }
+                      Thread.sleep(700L * (attempt + 1))
+                  }
+                  return null
+              }
+          }
+          APKEOF
+          mkdir -p "$(dirname app/src/main/java/com/example/apktranslator/Pipeline.kt)"
+          cat > app/src/main/java/com/example/apktranslator/Pipeline.kt <<'APKEOF'
+          package com.example.apktranslator
+
+          import android.security.keystore.KeyGenParameterSpec
+          import android.security.keystore.KeyProperties
+          import com.android.apksig.ApkSigner
+          import java.io.BufferedOutputStream
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.io.OutputStream
+          import java.security.KeyPairGenerator
+          import java.security.KeyStore
+          import java.security.PrivateKey
+          import java.security.cert.X509Certificate
+          import java.security.spec.ECGenParameterSpec
+          import java.util.concurrent.ConcurrentHashMap
+          import java.util.concurrent.Executors
+          import java.util.concurrent.atomic.AtomicInteger
+          import java.util.zip.CRC32
+          import java.util.zip.ZipEntry
+          import java.util.zip.ZipFile
+          import java.util.zip.ZipOutputStream
+          import javax.security.auth.x500.X500Principal
+
+          object Pipeline {
+
+              fun run(input: File, cacheDir: File, log: (String) -> Unit, progress: (Int, Int) -> Unit): File {
+                  ZipFile(input).use { zip ->
+                      val arscEntry = zip.getEntry("resources.arsc")
+                          ?: throw IllegalStateException("الملف ما فيه resources.arsc (مو APK عادي؟)")
+                      log("قراءة الموارد...")
+                      val arscBytes = zip.getInputStream(arscEntry).use { it.readBytes() }
+                      val doc = ArscDoc(arscBytes)
+                      val candidates = doc.findCandidates()
+                      val unique = candidates.values.filter { Translator.looksTranslatable(it) }.toSet().toList()
+                      log("نصوص مرشحة: ${candidates.size} | للترجمة: ${unique.size}")
+
+                      val results = ConcurrentHashMap<String, String>()
+                      if (unique.isNotEmpty()) {
+                          val pool = Executors.newFixedThreadPool(4)
+                          val done = AtomicInteger(0)
+                          val failed = AtomicInteger(0)
+                          val futures = unique.map { text ->
+                              pool.submit(Runnable {
+                                  val r = Translator.translate(text)
+                                  if (r != null) results[text] = r else failed.incrementAndGet()
+                                  progress(done.incrementAndGet(), unique.size)
+                              })
+                          }
+                          futures.forEach { it.get() }
+                          pool.shutdown()
+                          if (failed.get() == unique.size) {
+                              throw IllegalStateException("تعذر الاتصال بخدمة الترجمة، تأكد من الإنترنت")
+                          }
+                          log("تمت الترجمة: ${results.size} | فشل (تُركت كما هي): ${failed.get()}")
+                      }
+
+                      val repl = HashMap<Int, String>()
+                      for ((idx, text) in candidates) {
+                          val t = results[text]
+                          if (t != null) repl[idx] = t
+                      }
+                      val newArsc = doc.applyTranslations(repl)
+
+                      log("إعادة بناء الـ APK...")
+                      val unsigned = File(cacheDir, "unsigned.apk")
+                      val signed = File(cacheDir, "translated.apk")
+                      unsigned.delete()
+                      signed.delete()
+                      rewriteZip(zip, unsigned, newArsc)
+
+                      log("توقيع الـ APK...")
+                      sign(unsigned, signed)
+                      unsigned.delete()
+                      return signed
+                  }
+              }
+
+              private class CountingStream(private val out: OutputStream) : OutputStream() {
+                  var count = 0L
+                  override fun write(b: Int) { out.write(b); count++ }
+                  override fun write(b: ByteArray, off: Int, len: Int) { out.write(b, off, len); count += len }
+                  override fun flush() = out.flush()
+                  override fun close() = out.close()
+              }
+
+              private fun isOldSignature(name: String): Boolean {
+                  if (!name.startsWith("META-INF/")) return false
+                  val u = name.uppercase()
+                  return u == "META-INF/MANIFEST.MF" || u.endsWith(".SF") || u.endsWith(".RSA") ||
+                      u.endsWith(".DSA") || u.endsWith(".EC")
+              }
+
+              private fun alignExtra(offsetBeforeHeader: Long, nameLen: Int, align: Int): ByteArray? {
+                  val dataOff = offsetBeforeHeader + 30 + nameLen
+                  var pad = ((align - (dataOff % align)) % align).toInt()
+                  if (pad == 0) return null
+                  if (pad < 4) pad += align
+                  val extra = ByteArray(pad)
+                  extra[0] = 0x35.toByte(); extra[1] = 0xD9.toByte()   // zipalign padding id 0xD935
+                  val len = pad - 4
+                  extra[2] = (len and 0xFF).toByte(); extra[3] = ((len shr 8) and 0xFF).toByte()
+                  return extra
+              }
+
+              private fun rewriteZip(zip: ZipFile, dest: File, newArsc: ByteArray) {
+                  val counting = CountingStream(BufferedOutputStream(FileOutputStream(dest), 1 shl 16))
+                  ZipOutputStream(counting).use { zos ->
+                      val names = HashSet<String>()
+                      val en = zip.entries()
+                      while (en.hasMoreElements()) {
+                          val e = en.nextElement()
+                          val name = e.name
+                          if (e.isDirectory || isOldSignature(name) || !names.add(name)) continue
+
+                          val isArsc = name == "resources.arsc"
+                          if (isArsc || e.method == ZipEntry.STORED) {
+                              val ne = ZipEntry(name)
+                              ne.method = ZipEntry.STORED
+                              if (isArsc) {
+                                  val crc = CRC32().apply { update(newArsc) }
+                                  ne.size = newArsc.size.toLong()
+                                  ne.compressedSize = newArsc.size.toLong()
+                                  ne.crc = crc.value
+                              } else {
+                                  ne.size = e.size
+                                  ne.compressedSize = e.size
+                                  ne.crc = e.crc
+                              }
+                              val align = if (name.endsWith(".so")) 16384 else 4
+                              val extra = alignExtra(counting.count, name.toByteArray(Charsets.UTF_8).size, align)
+                              if (extra != null) ne.extra = extra
+                              zos.putNextEntry(ne)
+                              if (isArsc) zos.write(newArsc) else zip.getInputStream(e).use { it.copyTo(zos) }
+                              zos.closeEntry()
+                          } else {
+                              val ne = ZipEntry(name)
+                              ne.method = ZipEntry.DEFLATED
+                              zos.putNextEntry(ne)
+                              zip.getInputStream(e).use { it.copyTo(zos) }
+                              zos.closeEntry()
+                          }
+                      }
+                  }
+              }
+
+              private const val ALIAS = "apk_translator_key"
+
+              private fun sign(unsigned: File, out: File) {
+                  val ks = KeyStore.getInstance("AndroidKeyStore")
+                  ks.load(null)
+                  if (!ks.containsAlias(ALIAS)) {
+                      val kpg = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")
+                      kpg.initialize(
+                          KeyGenParameterSpec.Builder(ALIAS, KeyProperties.PURPOSE_SIGN)
+                              .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
+                              .setDigests(KeyProperties.DIGEST_SHA256)
+                              .setCertificateSubject(X500Principal("CN=APK Translator"))
+                              .build()
+                      )
+                      kpg.generateKeyPair()
+                  }
+                  val key = ks.getKey(ALIAS, null) as PrivateKey
+                  val cert = ks.getCertificate(ALIAS) as X509Certificate
+                  val cfg = ApkSigner.SignerConfig.Builder("translator", key, listOf(cert)).build()
+                  ApkSigner.Builder(listOf(cfg))
+                      .setInputApk(unsigned)
+                      .setOutputApk(out)
+                      .setMinSdkVersion(24)
+                      .setV1SigningEnabled(false)
+                      .setV2SigningEnabled(true)
+                      .setV3SigningEnabled(false)
+                      .build()
+                      .sign()
+              }
+          }
+          APKEOF
+          mkdir -p "$(dirname app/src/main/java/com/example/apktranslator/MainActivity.kt)"
+          cat > app/src/main/java/com/example/apktranslator/MainActivity.kt <<'APKEOF'
+          package com.example.apktranslator
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.util.Log
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ProgressBar
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.io.File
+
+          class MainActivity : Activity() {
+              private lateinit var statusView: TextView
+              private lateinit var logView: TextView
+              private lateinit var progressBar: ProgressBar
+              private lateinit var pickButton: Button
+              private var resultFile: File? = null
+              private val reqPick = 101
+              private val reqSave = 102
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(40), dp(16), dp(16))
+                      layoutDirection = View.LAYOUT_DIRECTION_RTL
+                  }
+                  root.addView(TextView(this).apply {
+                      text = "مترجم التطبيقات"
+                      textSize = 24f
+                      gravity = Gravity.CENTER
+                  })
+                  root.addView(TextView(this).apply {
+                      text = "اختر ملف APK وسيترجم كل النصوص الإنجليزية في موارده إلى العربية ثم يوقّعه من جديد."
+                      textSize = 14f
+                      setPadding(0, dp(12), 0, dp(12))
+                  })
+                  pickButton = Button(this).apply {
+                      text = "اختيار ملف APK"
+                      setOnClickListener {
+                          val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                              addCategory(Intent.CATEGORY_OPENABLE)
+                              type = "*/*"
+                          }
+                          startActivityForResult(i, reqPick)
+                      }
+                  }
+                  root.addView(pickButton)
+                  progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+                      max = 100
+                      setPadding(0, dp(12), 0, dp(4))
+                  }
+                  root.addView(progressBar)
+                  statusView = TextView(this).apply { textSize = 15f }
+                  root.addView(statusView)
+                  logView = TextView(this).apply { textSize = 12f }
+                  root.addView(ScrollView(this).apply { addView(logView) },
+                      LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+                  setContentView(root)
+              }
+
+              private fun ui(block: () -> Unit) = runOnUiThread { block() }
+              private fun addLog(s: String) { logView.append(s + "\n") }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (resultCode != RESULT_OK || data?.data == null) return
+                  val uri = data.data!!
+                  when (requestCode) {
+                      reqPick -> process(uri)
+                      reqSave -> saveTo(uri)
+                  }
+              }
+
+              private fun process(uri: Uri) {
+                  pickButton.isEnabled = false
+                  logView.text = ""
+                  statusView.text = "جاري المعالجة..."
+                  progressBar.progress = 0
+                  Thread {
+                      try {
+                          val input = File(cacheDir, "input.apk")
+                          contentResolver.openInputStream(uri)!!.use { ins ->
+                              input.outputStream().use { ins.copyTo(it) }
+                          }
+                          val out = Pipeline.run(
+                              input, cacheDir,
+                              { msg -> ui { addLog(msg) } },
+                              { done, total ->
+                                  ui {
+                                      progressBar.max = total
+                                      progressBar.progress = done
+                                      statusView.text = "الترجمة: $done / $total"
+                                  }
+                              }
+                          )
+                          resultFile = out
+                          ui {
+                              statusView.text = "تمت الترجمة ✔ اختر مكان حفظ الملف"
+                              val i = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                                  addCategory(Intent.CATEGORY_OPENABLE)
+                                  type = "application/vnd.android.package-archive"
+                                  putExtra(Intent.EXTRA_TITLE, "translated.apk")
+                              }
+                              startActivityForResult(i, reqSave)
+                          }
+                      } catch (t: Throwable) {
+                          ui {
+                              statusView.text = "فشل: ${t.message}"
+                              addLog(Log.getStackTraceString(t))
+                          }
+                      } finally {
+                          ui { pickButton.isEnabled = true }
+                      }
+                  }.start()
+              }
+
+              private fun saveTo(uri: Uri) {
+                  val f = resultFile ?: return
+                  try {
+                      contentResolver.openOutputStream(uri)!!.use { os -> f.inputStream().use { it.copyTo(os) } }
+                      statusView.text = "تم الحفظ ✔ ثبّت الملف (احذف التطبيق الأصلي أولاً لأن التوقيع تغيّر)"
+                      Toast.makeText(this, "تم الحفظ", Toast.LENGTH_SHORT).show()
+                  } catch (t: Throwable) {
+                      statusView.text = "فشل الحفظ: ${t.message}"
+                  }
+              }
+          }
+          APKEOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ApkTranslator
+          path: app/build/outputs/apk/debug/app-debug.apk
